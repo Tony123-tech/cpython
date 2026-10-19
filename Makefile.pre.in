@@ -561,6 +561,7 @@ OBJECT_OBJS=	\
 		Objects/iterobject.o \
 		Objects/lazyimportobject.o \
 		Objects/listobject.o \
+		Objects/optionobject.o \
 		Objects/longobject.o \
 		Objects/dictobject.o \
 		Objects/odictobject.o \

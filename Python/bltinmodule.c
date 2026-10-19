@@ -18,6 +18,7 @@
 #include "pycore_pystate.h"       // _PyThreadState_GET()
 #include "pycore_pythonrun.h"     // _Py_SourceAsString()
 #include "pycore_tuple.h"         // _PyTuple_Recycle()
+#include "optionobject.h"         // PyOptionObject, PyOption_IS_NOTHING, PyOption_Some, PyOption_Nothing()
 
 #include "clinic/bltinmodule.c.h"
 
@@ -25,6 +26,10 @@
 #  include <unistd.h>             // isatty()
 #endif
 
+// Forward declarations for Result type
+extern PyTypeObject Result_Type;
+static PyObject *builtin_Ok(PyObject *module, PyObject *arg);
+static PyObject *builtin_Err(PyObject *module, PyObject *arg);
 
 static PyObject*
 update_bases(PyObject *bases, PyObject *const *args, Py_ssize_t nargs)
@@ -3424,11 +3429,16 @@ PyTypeObject PyZip_Type = {
     PyObject_GC_Del,                    /* tp_free */
 };
 
+PyDoc_STRVAR(option_some_doc,
+             "Some(value) -> Option\n"
+             "\n"
+             "Return Some(value).");
 
 static PyMethodDef builtin_methods[] = {
     {"__build_class__", _PyCFunction_CAST(builtin___build_class__),
      METH_FASTCALL | METH_KEYWORDS, build_class_doc},
     BUILTIN___IMPORT___METHODDEF
+    {"Some", PyOption_BuiltinSome, METH_O, option_some_doc},
     BUILTIN___LAZY_IMPORT___METHODDEF
     BUILTIN_ABS_METHODDEF
     BUILTIN_ALL_METHODDEF
@@ -3471,7 +3481,10 @@ static PyMethodDef builtin_methods[] = {
     BUILTIN_SORTED_METHODDEF
     BUILTIN_SUM_METHODDEF
     BUILTIN_VARS_METHODDEF
+    {"Ok", _PyCFunction_CAST(builtin_Ok), METH_O, "Create a success Result."},
+    {"Err", _PyCFunction_CAST(builtin_Err), METH_O, "Create an error Result."},
     {NULL,              NULL},
+
 };
 
 PyDoc_STRVAR(builtin_doc,
@@ -3491,7 +3504,7 @@ static struct PyModuleDef builtinsmodule = {
     "builtins",
     builtin_doc,
     -1, /* multiple "initialization" just copies the module dict. */
-    builtin_methods,
+    &builtin_methods[0],
     NULL,
     NULL,
     NULL,
@@ -3560,6 +3573,7 @@ _PyBuiltin_Init(PyInterpreterState *interp)
     mod = _PyModule_CreateInitialized(&builtinsmodule, PYTHON_API_VERSION);
     if (mod == NULL)
         return NULL;
+
 #ifdef Py_GIL_DISABLED
     PyUnstable_Module_SetGIL(mod, Py_MOD_GIL_NOT_USED);
 #endif
@@ -3576,6 +3590,7 @@ _PyBuiltin_Init(PyInterpreterState *interp)
 #else
 #define ADD_TO_ALL(OBJECT) (void)0
 #endif
+
 
 #define SETBUILTIN(NAME, OBJECT) \
     if (PyDict_SetItemString(dict, NAME, (PyObject *)OBJECT) < 0)       \
@@ -3615,14 +3630,388 @@ _PyBuiltin_Init(PyInterpreterState *interp)
     SETBUILTIN("tuple",                 &PyTuple_Type);
     SETBUILTIN("type",                  &PyType_Type);
     SETBUILTIN("zip",                   &PyZip_Type);
-    debug = PyBool_FromLong(config->optimization_level == 0);
-    if (PyDict_SetItemString(dict, "__debug__", debug) < 0) {
-        Py_DECREF(debug);
+
+    if (PyType_Ready(&Result_Type) < 0) {
         return NULL;
     }
+    SETBUILTIN("Result", &Result_Type);
+    if (_PyOption_InitTypes() < 0) {
+        return NULL;
+    }
+    SETBUILTIN("Option", &PyOption_Type);
+    SETBUILTIN("Nothing", PyOption_Nothing());
+    debug = PyBool_FromLong(config->optimization_level == 0);
+
     Py_DECREF(debug);
 
     return mod;
 #undef ADD_TO_ALL
 #undef SETBUILTIN
 }
+
+/* ==========================================================
+ * Native Result Type Implementation (Rust-style)
+ * ========================================================== */
+// Internal C structure for the Result object
+
+typedef struct {
+    PyObject_HEAD
+    PyObject *inner_value; // Stores either the success value or error object
+    int is_ok;             // 1 if Ok, 0 if Err
+} ResultObject;
+
+// Forward declaration of the Result type object
+PyTypeObject Result_Type;
+
+// Constructor: Ok(value)
+static PyObject *
+builtin_Ok(PyObject *module, PyObject *arg) {
+    ResultObject *self = (ResultObject *)Result_Type.tp_alloc(&Result_Type, 0);
+    if (self == NULL) {
+        return NULL;
+    }
+    self->inner_value = Py_NewRef(arg);
+    self->is_ok = 1;
+    return (PyObject *)self;
+}
+
+// Constructor: Err(value)
+static PyObject *
+builtin_Err(PyObject *module, PyObject *arg) {
+    ResultObject *self = (ResultObject *)Result_Type.tp_alloc(&Result_Type, 0);
+    if (self == NULL) {
+        return NULL;
+    }
+    self->inner_value = Py_NewRef(arg);
+    self->is_ok = 0;
+    return (PyObject *)self;
+}
+
+// Method: result.is_ok()
+static PyObject *
+result_is_ok(ResultObject *self, PyObject *Py_UNUSED(ignored)) {
+    if (self->is_ok) {
+        Py_RETURN_TRUE;
+    }
+    Py_RETURN_FALSE;
+}
+
+// Method: result.is_err()
+static PyObject *
+result_is_err(ResultObject *self, PyObject *Py_UNUSED(ignored)) {
+    if (!self->is_ok) {
+        Py_RETURN_TRUE;
+    }
+    Py_RETURN_FALSE;
+}
+
+// Method: result.is_ok_and(func)
+static PyObject *
+result_is_ok_and(ResultObject *self, PyObject *func) {
+    if (!self->is_ok) {
+        Py_RETURN_FALSE;
+    }
+    PyObject *res = PyObject_CallOneArg(func, self->inner_value);
+    if (res == NULL) {
+        return NULL;
+    }
+    int is_true = PyObject_IsTrue(res);
+    Py_DECREF(res);
+    if (is_true < 0) {
+        return NULL;
+    }
+    if (is_true) {
+        Py_RETURN_TRUE;
+    } else {
+        Py_RETURN_FALSE;
+    }
+}
+
+// Method: result.is_err_and(func)
+static PyObject *
+result_is_err_and(ResultObject *self, PyObject *func) {
+    if (self->is_ok) {
+        Py_RETURN_FALSE;
+    }
+    PyObject *res = PyObject_CallOneArg(func, self->inner_value);
+    if (res == NULL) {
+        return NULL;
+    }
+    int is_true = PyObject_IsTrue(res);
+    Py_DECREF(res);
+    if (is_true < 0) {
+        return NULL;
+    }
+    if (is_true) {
+        Py_RETURN_TRUE;
+    } else {
+        Py_RETURN_FALSE;
+    }
+}
+
+// Method: result.unwrap()
+static PyObject *
+result_unwrap(ResultObject *self, PyObject *Py_UNUSED(ignored)) {
+    if (!self->is_ok) {
+        PyErr_SetString(PyExc_ValueError, "Called unwrap() on an Err Result");
+        return NULL;
+    }
+    Py_INCREF(self->inner_value);
+    return self->inner_value;
+}
+
+// Method: result.expect(msg)
+static PyObject *
+result_expect(ResultObject *self, PyObject *msg_str) {
+    if (!self->is_ok) {
+        if (PyUnicode_Check(msg_str)) {
+            PyErr_SetObject(PyExc_ValueError, msg_str);
+        } else {
+            PyErr_SetString(PyExc_ValueError, "Called expect() on an Err Result");
+        }
+        return NULL;
+    }
+    Py_INCREF(self->inner_value);
+    return self->inner_value;
+}
+
+// Method: result.unwrap_err()
+static PyObject *
+result_unwrap_err(ResultObject *self, PyObject *Py_UNUSED(ignored)) {
+    if (self->is_ok) {
+        PyErr_SetString(PyExc_ValueError, "Called unwrap_err() on an Ok Result");
+        return NULL;
+    }
+    Py_INCREF(self->inner_value);
+    return self->inner_value;
+}
+
+// Method: result.unwrap_or(default_value)
+static PyObject *
+result_unwrap_or(ResultObject *self, PyObject *default_val) {
+    if (self->is_ok) {
+        Py_INCREF(self->inner_value);
+        return self->inner_value;
+    }
+    Py_INCREF(default_val);
+    return default_val;
+}
+
+// Method: result.unwrap_or_else(func)
+static PyObject *
+result_unwrap_or_else(ResultObject *self, PyObject *func) {
+    if (self->is_ok) {
+        Py_INCREF(self->inner_value);
+        return self->inner_value;
+    }
+    return PyObject_CallOneArg(func, self->inner_value);
+}
+
+// Method: result.map(func)
+static PyObject *
+result_map(ResultObject *self, PyObject *func) {
+    if (!self->is_ok) {
+        Py_INCREF(self);
+        return (PyObject *)self;
+    }
+    PyObject *new_val = PyObject_CallOneArg(func, self->inner_value);
+    if (new_val == NULL) {
+        return NULL;
+    }
+    PyObject *res = builtin_Ok(NULL, new_val);
+    Py_DECREF(new_val);
+    return res;
+}
+
+// Method: result.map_err(func)
+static PyObject *
+result_map_err(ResultObject *self, PyObject *func) {
+    if (self->is_ok) {
+        Py_INCREF(self);
+        return (PyObject *)self;
+    }
+    PyObject *new_err = PyObject_CallOneArg(func, self->inner_value);
+    if (new_err == NULL) {
+        return NULL;
+    }
+    PyObject *res = builtin_Err(NULL, new_err);
+    Py_DECREF(new_err);
+    return res;
+}
+
+// Method: result.map_or(default, func)
+static PyObject *
+result_map_or(ResultObject *self, PyObject *const *args, Py_ssize_t nargs) {
+    if (nargs != 2) {
+        PyErr_SetString(PyExc_TypeError, "map_or() requires exactly 2 arguments (default, func)");
+        return NULL;
+    }
+    PyObject *default_val = args[0];
+    PyObject *func = args[1];
+
+    if (!self->is_ok) {
+        Py_INCREF(default_val);
+        return default_val;
+    }
+    return PyObject_CallOneArg(func, self->inner_value);
+}
+
+// Method: result.map_or_else(default_func, func)
+static PyObject *
+result_map_or_else(ResultObject *self, PyObject *const *args, Py_ssize_t nargs) {
+    if (nargs != 2) {
+        PyErr_SetString(PyExc_TypeError, "map_or_else() requires exactly 2 arguments (default_func, func)");
+        return NULL;
+    }
+    PyObject *default_func = args[0];
+    PyObject *func = args[1];
+
+    if (!self->is_ok) {
+        return PyObject_CallOneArg(default_func, self->inner_value);
+    }
+    return PyObject_CallOneArg(func, self->inner_value);
+}
+
+// Method: result.and_then(func)
+static PyObject *
+result_and_then(ResultObject *self, PyObject *func) {
+    if (!self->is_ok) {
+        Py_INCREF(self);
+        return (PyObject *)self;
+    }
+    return PyObject_CallOneArg(func, self->inner_value);
+}
+
+// Method: result.or_else(func)
+static PyObject *
+result_or_else(ResultObject *self, PyObject *func) {
+    if (self->is_ok) {
+        Py_INCREF(self);
+        return (PyObject *)self;
+    }
+    return PyObject_CallOneArg(func, self->inner_value);
+}
+
+// Method: result.ok()
+static PyObject *
+result_ok(ResultObject *self, PyObject *Py_UNUSED(ignored)) {
+    if (self->is_ok) {
+        Py_INCREF(self->inner_value);
+        return self->inner_value;
+    }
+    Py_RETURN_NONE;
+}
+
+// Method: result.err()
+static PyObject *
+result_err(ResultObject *self, PyObject *Py_UNUSED(ignored)) {
+    if (!self->is_ok) {
+        Py_INCREF(self->inner_value);
+        return self->inner_value;
+    }
+    Py_RETURN_NONE;
+}
+
+// Method: result.inspect(func)
+static PyObject *
+result_inspect(ResultObject *self, PyObject *func) {
+    if (self->is_ok) {
+        PyObject *res = PyObject_CallOneArg(func, self->inner_value);
+        if (res == NULL) {
+            return NULL;
+        }
+        Py_DECREF(res);
+    }
+    Py_INCREF(self);
+    return (PyObject *)self;
+}
+
+// Method: result.inspect_err(func)
+static PyObject *
+result_inspect_err(ResultObject *self, PyObject *func) {
+    if (!self->is_ok) {
+        PyObject *res = PyObject_CallOneArg(func, self->inner_value);
+        if (res == NULL) {
+            return NULL;
+        }
+        Py_DECREF(res);
+    }
+    Py_INCREF(self);
+    return (PyObject *)self;
+}
+
+// Representation: repr(result)
+static PyObject *
+result_repr(ResultObject *self) {
+    const char *kind = self->is_ok ? "Ok" : "Err";
+    PyObject *repr_val = PyObject_Repr(self->inner_value);
+    if (repr_val == NULL) {
+        return NULL;
+    }
+    PyObject *result = PyUnicode_FromFormat("%s(%U)", kind, repr_val);
+    Py_DECREF(repr_val);
+    return result;
+}
+
+// Deallocation
+static void
+result_dealloc(ResultObject *self) {
+    PyObject_GC_UnTrack(self);
+    Py_XDECREF(self->inner_value);
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+// GC Support: Traverse
+static int
+result_traverse(ResultObject *self, visitproc visit, void *arg) {
+    Py_VISIT(self->inner_value);
+    return 0;
+}
+
+// GC Support: Clear
+static int
+result_clear(ResultObject *self) {
+    Py_CLEAR(self->inner_value);
+    return 0;
+}
+
+// Method table mapping instance methods to Python
+static PyMethodDef result_methods[] = {
+    {"is_ok", (PyCFunction)result_is_ok, METH_NOARGS, "Return True if Result is Ok."},
+    {"is_err", (PyCFunction)result_is_err, METH_NOARGS, "Return True if Result is Err."},
+    {"is_ok_and", (PyCFunction)result_is_ok_and, METH_O, "Return True if Ok and condition matches."},
+    {"is_err_and", (PyCFunction)result_is_err_and, METH_O, "Return True if Err and condition matches."},
+    {"unwrap", (PyCFunction)result_unwrap, METH_NOARGS, "Extract value or raise ValueError if Err."},
+    {"expect", (PyCFunction)result_expect, METH_O, "Extract value or raise ValueError with custom message."},
+    {"unwrap_err", (PyCFunction)result_unwrap_err, METH_NOARGS, "Extract error value or raise ValueError if Ok."},
+    {"unwrap_or", (PyCFunction)result_unwrap_or, METH_O, "Extract value or return default if Err."},
+    {"unwrap_or_else", (PyCFunction)result_unwrap_or_else, METH_O, "Extract value or compute fallback if Err."},
+    {"map", (PyCFunction)result_map, METH_O, "Apply function to Ok value."},
+    {"map_err", (PyCFunction)result_map_err, METH_O, "Apply function to Err value."},
+    {"map_or", (PyCFunction)result_map_or, METH_FASTCALL, "Apply function to Ok or return default."},
+    {"map_or_else", (PyCFunction)result_map_or_else, METH_FASTCALL, "Apply function to Ok or evaluate default function."},
+    {"and_then", (PyCFunction)result_and_then, METH_O, "Chain operations returning a Result."},
+    {"or_else", (PyCFunction)result_or_else, METH_O, "Recover from Err by returning a new Result."},
+    {"ok", (PyCFunction)result_ok, METH_NOARGS, "Convert Result to Optional value."},
+    {"err", (PyCFunction)result_err, METH_NOARGS, "Convert Result to Optional error."},
+    {"inspect", (PyCFunction)result_inspect, METH_O, "Inspect Ok value without consuming."},
+    {"inspect_err", (PyCFunction)result_inspect_err, METH_O, "Inspect Err value without consuming."},
+    {NULL, NULL, 0, NULL} // Sentinel
+};
+
+// Define the Python Type Object spec
+PyTypeObject Result_Type = {
+    PyVarObject_HEAD_INIT(&PyType_Type, 0)
+    .tp_name = "builtins.Result",
+    .tp_basicsize = sizeof(ResultObject),
+    .tp_itemsize = 0,
+    .tp_dealloc = (destructor)result_dealloc,
+    .tp_repr = (reprfunc)result_repr,
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
+    .tp_traverse = (traverseproc)result_traverse,
+    .tp_clear = (inquiry)result_clear,
+    .tp_methods = result_methods,
+    .tp_doc = "Native Result type representing success (Ok) or failure (Err).",
+    .tp_alloc = PyType_GenericAlloc,
+    .tp_free = PyObject_GC_Del,
+};
