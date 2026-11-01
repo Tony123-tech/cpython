@@ -142,6 +142,30 @@ class GenopsTests(unittest.TestCase):
                 'not enough data in stream to read int4'):
             next(it)
 
+    def test_truncated_arg_readers(self):
+        # Each argument reader raises ValueError when the stream is
+        # truncated.  Only read_int4 was covered before (via 'J').
+        cases = [
+            (b'K', 'not enough data in stream to read uint1'),
+            (b'M\x12', 'not enough data in stream to read uint2'),
+            (b'J\x12\x34', 'not enough data in stream to read int4'),
+            (b'r\x12\x34\x56', 'not enough data in stream to read uint4'),
+            (b'C', 'not enough data in stream to read uint1'),
+            (b'B\x03\x00\x00\x00ab',
+             'expected 3 bytes in a bytes4, but only 2 remain'),
+            (b'\x8e\x03' + b'\x00' * 7 + b'ab',
+             'expected 3 bytes in a bytes8, but only 2 remain'),
+            (b'\x96\x03' + b'\x00' * 7 + b'ab',
+             'expected 3 bytes in a bytearray8, but only 2 remain'),
+            (b'\x8a\x03ab', 'not enough data in stream to read long1'),
+            (b'\x8b\x03\x00\x00\x00ab',
+             'not enough data in stream to read long4'),
+        ]
+        for data, msg in cases:
+            with self.subTest(data=data):
+                with self.assertRaisesRegex(ValueError, msg):
+                    list(pickletools.genops(data))
+
     def test_unknown_opcode(self):
         it = pickletools.genops(b'N\xff')
         item = next(it)
